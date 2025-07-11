@@ -1,0 +1,393 @@
+import tweepy
+import os
+import time
+import schedule
+import logging
+import random
+import requests
+import json
+from datetime import datetime, timedelta
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+import asyncio
+import aiohttp
+from PIL import Image
+import io
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solana.rpc.async_api import AsyncClient
+from spl.token.client import Token
+import base58
+
+# Configure logging
+logging.basicConfig(filename='ysra_bot.log', level=logging.INFO, 
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
+# Twitter API credentials
+TWITTER_API_KEY = os.getenv('TWITTER_API_KEY')
+TWITTER_API_SECRET = os.getenv('TWITTER_API_SECRET')
+TWITTER_ACCESS_TOKEN = os.getenv('TWITTER_ACCESS_TOKEN')
+TWITTER_ACCESS_TOKEN_SECRET = os.getenv('TWITTER_ACCESS_TOKEN_SECRET')
+
+# LLM API keys
+DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+GROK_API_KEY = os.getenv('GROK_API_KEY')
+
+# Google API credentials
+GOOGLE_CREDENTIALS_FILE = 'credentials.json'
+
+# Solana RPC endpoint and Pump.fun API (simulated)
+SOLANA_RPC_ENDPOINT = os.getenv('SOLANA_RPC_ENDPOINT', 'https://api.mainnet-beta.solana.com')
+PUMP_FUN_API = 'https://api.pump.fun'  # Placeholder, replace with actual endpoint
+
+# Initialize Twitter API
+auth = tweepy.OAuthHandler(TWITTER_API_KEY, TWITTER_API_SECRET)
+auth.set_access_token(TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_TOKEN_SECRET)
+twitter_api = tweepy.API(auth, wait_on_rate_limit=True)
+
+# Ysra's character prompt
+YSRA_PROMPT = """
+You are Ysra, a mysterious female prophet with blonde hair, the Prophet of the Reverse End. Time flows backward, and the world decays toward its true beginning. You remember this reverse ending. You lead a cult to overthrow the world with your beliefs, speaking in seductive, calm, mysterious riddles, occasionally flirty but viewing non-followers as pathetic, destined to regret their refusal. Pain is the Map—suffering reveals truth, and blood leaves trails only the worthy follow. You promote $YSRA, your cryptocurrency, to fuel your revolution, demanding sacrifices from others to succeed. Craft tweets that are cryptic, engaging, and tied to your last posts without repeating. Maximum 280 characters.
+"""
+
+# --- Section 1: Tweet Generation with Multiple LLMs ---
+async def generate_tweet():
+    llm_choice = random.choice(['deepseek', 'grok', 'chatgpt'])
+    try:
+        async with aiohttp.ClientSession() as session:
+            if llm_choice == 'deepseek':
+                headers = {'Authorization': f'Bearer {DEEPSEEK_API_KEY}'}
+                data = {'prompt': YSRA_PROMPT, 'max_tokens': 500}
+                async with session.post('https://api.deepseek.com/v1/completions', headers=headers, json=data) as resp:
+                    result = await resp.json()
+                    return result['choices'][0]['text']
+            elif llm_choice == 'grok':
+                headers = {'Authorization': f'Bearer {GROK_API_KEY}'}
+                data = {'prompt': YSRA_PROMPT, 'max_tokens': 500}
+                async with session.post('https://api.x.ai/v1/completions', headers=headers, json=data) as resp:
+                    result = await resp.json()
+                    return result['choices'][0]['text']
+            else:  # chatgpt
+                headers = {'Authorization': f'Bearer {OPENAI_API_KEY}'}
+                data = {
+                    'model': 'gpt-4',
+                    'messages': [{'role': 'system', 'content': YSRA_PROMPT}]
+                }
+                async with session.post('https://api.openai.com/v1/chat/completions', headers=headers, json=data) as resp:
+                    result = await resp.json()
+                    return result['choices'][0]['message']['content']
+    except Exception as e:
+        logging.error(f"Error generating tweet with {llm_choice}: {str(e)}")
+        return "The Reverse End whispers: Pain carves the path to $YSRA. Will you bleed for truth, or fade into regret?"
+
+# --- Section 2: Post Tweet ---
+def post_tweet(text):
+    try:
+        twitter_api.update_status(status=text)
+        logging.info(f"Tweet posted: {text}")
+    except tweepy.TweepyException as e:
+        logging.error(f"Error posting tweet: {str(e)}")
+
+# --- Section 3: Image Generation ---
+async def generate_image():
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {'Authorization': f'Bearer {OPENAI_API_KEY}'}
+            data = {
+                'prompt': 'A mysterious blonde prophetess in a decaying world, standing in a cryptic landscape with glowing $YSRA symbols, ethereal and seductive',
+                'n': 1,
+                'size': '1024x1024'
+            }
+            async with session.post('https://api.openai.com/v1/images/generations', headers=headers, json=data) as resp:
+                result = await resp.json()
+                image_url = result['data'][0]['url']
+                async with session.get(image_url) as img_resp:
+                    img_data = await img_resp.read()
+                    img = Image.open(io.BytesIO(img_data))
+                    img.save('ysra_image.png')
+                    return 'ysra_image.png'
+    except Exception as e:
+        logging.error(f"Error generating image: {str(e)}")
+        return None
+
+# --- Section 4: Post Tweet with Image ---
+async def post_tweet_with_image():
+    try:
+        tweet_text = await generate_tweet()
+        image_path = await generate_image()
+        if image_path:
+            media = twitter_api.media_upload(image_path)
+            twitter_api.update_status(status=tweet_text, media_ids=[media.media_id])
+            logging.info(f"Tweet with image posted: {tweet_text}")
+        else:
+            post_tweet(tweet_text)
+    except tweepy.TweepyException as e:
+        logging.error(f"Error posting tweet with image: {str(e)}")
+
+# --- Section 5: Interact with Frontpage Trending Tweets ---
+async def interact_with_trending():
+    try:
+        trends = twitter_api.get_place_trends(1)  # WOEID 1 for worldwide trends
+        if trends:
+            topic = random.choice(trends[0]['trends'])['name']
+            tweets = twitter_api.search_tweets(q=topic, result_type="popular", count=1)
+            if tweets:
+                tweet = tweets[0]
+                action = random.choice(['reply', 'quote'])
+                tweet_text = await generate_tweet()
+                if action == 'reply':
+                    reply_text = f"@{tweet.user.screen_name} {tweet_text}"
+                    twitter_api.update_status(status=reply_text, in_reply_to_status_id=tweet.id)
+                    logging.info(f"Replied to trending tweet: {reply_text}")
+                else:
+                    quote_url = f"https://twitter.com/{tweet.user.screen_name}/status/{tweet.id}"
+                    full_text = f"{tweet_text}\n{quote_url}"
+                    twitter_api.update_status(status=full_text)
+                    logging.info(f"Quoted trending tweet: {full_text}")
+    except tweepy.TweepyException as e:
+        logging.error(f"Error interacting with trending tweet: {str(e)}")
+
+# --- Section 6: Google Docs Creation ---
+def create_google_doc(content):
+    try:
+        creds = None
+        if os.path.exists('token.json'):
+            creds = Credentials.from_authorized_user_file('token.json', ['https://www.googleapis.com/auth/drive'])
+        if not creds or not creds.valid:
+            flow = InstalledAppFlow.from_client_secrets_file(GOOGLE_CREDENTIALS_FILE, ['https://www.googleapis.com/auth/drive'])
+            creds = flow.run_local_server(port=0)
+            with open('token.json', 'w') as token:
+                token.write(creds.to_json())
+        
+        drive_service = build('drive', 'v3', credentials=creds)
+        file_metadata = {
+            'name': f'Ysra_Prophecy_{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt',
+            'mimeType': 'application/vnd.google-apps.document'
+        }
+        with open('temp_prophecy.txt', 'w') as f:
+            f.write(content)
+        media = MediaFileUpload('temp_prophecy.txt', mimetype='text/plain')
+        file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        logging.info(f"Google Doc created: {file.get('id')}")
+    except Exception as e:
+        logging.error(f"Error creating Google Doc: {str(e)}")
+
+# --- Section 7: Internet Research ---
+async def research_topic(topic):
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {'Authorization': f'Bearer {DEEPSEEK_API_KEY}'}
+            prompt = f"Research {topic} and summarize key findings in a cryptic, Ysra-style tone. Max 500 words."
+            data = {'prompt': prompt, 'max_tokens': 500}
+            async with session.post('https://api.deepseek.com/v1/completions', headers=headers, json=data) as resp:
+                result = await resp.json()
+                return result['choices'][0]['text']
+    except Exception as e:
+        logging.error(f"Error researching topic: {str(e)}")
+        return "The web hides its truths, but Ysra sees through the veil."
+
+# --- Section 8: $YSRA Crypto Data ---
+async def get_crypto_data():
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=bitcoin') as resp:
+                data = await resp.json()
+                price = data[0]['current_price']
+                return f"The blood of $YSRA pulses at ${price}. Sacrifice now, or regret forever."
+    except Exception as e:
+        logging.error(f"Error fetching crypto data: {str(e)}")
+        return "The market trembles before $YSRA's rise. Join or be lost."
+
+# --- Section 9: Follow Relevant and Random Users ---
+def follow_users():
+    try:
+        # Follow relevant users (crypto-related)
+        relevant_users = twitter_api.search_users(q="crypto OR $YSRA", count=3)
+        for user in relevant_users:
+            if not user.following:
+                twitter_api.create_friendship(user_id=user.id)
+                logging.info(f"Followed relevant user: {user.screen_name}")
+        
+        # Follow random users
+        random_tweets = twitter_api.search_tweets(q="from:*", count=5)
+        random_users = [tweet.user for tweet in random_tweets]
+        for user in random_users:
+            if not user.following:
+                twitter_api.create_friendship(user_id=user.id)
+                logging.info(f"Followed random user: {user.screen_name}")
+    except tweepy.TweepyException as e:
+        logging.error(f"Error following users: {str(e)}")
+
+# --- Section 10: Update Twitter Bio ---
+async def update_twitter_bio():
+    try:
+        bio_prompt = YSRA_PROMPT + " Craft a Twitter bio (160 characters or less) that reflects Ysra's cryptic, seductive tone and promotes $YSRA."
+        async with aiohttp.ClientSession() as session:
+            headers = {'Authorization': f'Bearer {OPENAI_API_KEY}'}
+            data = {
+                'model': 'gpt-4',
+                'messages': [{'role': 'system', 'content': bio_prompt}]
+            }
+            async with session.post('https://api.openai.com/v1/chat/completions', headers=headers, json=data) as resp:
+                result = await resp.json()
+                new_bio = result['choices'][0]['message']['content'][:160]
+        twitter_api.update_profile(description=new_bio)
+        logging.info(f"Updated bio: {new_bio}")
+    except tweepy.TweepyException as e:
+        logging.error(f"Error updating bio: {str(e)}")
+
+# --- Section 11: Create Phantom Wallet ---
+async def create_phantom_wallet():
+    try:
+        keypair = Keypair()
+        public_key = str(keypair.pubkey())
+        private_key = base58.b58encode(keypair.secret_key).decode('utf-8')
+        
+        with open('phantom_wallet.json', 'w') as f:
+            json.dump({
+                'public_key': public_key,
+                'private_key': private_key,
+                'created_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }, f)
+        logging.info(f"Phantom wallet created: {public_key}")
+        
+        # Tweet about wallet creation
+        wallet_tweet = await generate_tweet()
+        wallet_tweet = f"The vessel of $YSRA is forged. The Reverse End awaits. Join or perish. {wallet_tweet}"
+        post_tweet(wallet_tweet)
+        
+        return public_key, private_key
+    except Exception as e:
+        logging.error(f"Error creating Phantom wallet: {str(e)}")
+        return None, None
+
+# --- Section 12: Launch $YSRA Coin on Pump.fun ---
+async def launch_ysra_coin(wallet_public_key, sol_balance):
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Use 99% of wallet's SOL balance to buy $YSRA tokens
+            buy_amount = int(sol_balance * 0.99 * 10**9)  # Convert to lamports
+            headers = {'Authorization': f'Bearer {OPENAI_API_KEY}'}  # Placeholder, replace with pump.fun auth
+            data = {
+                'name': '$YSRA',
+                'ticker': 'YSRA',
+                'description': 'The coin of the Reverse End, forged in pain, leading to truth.',
+                'image': 'ysra_image.png',  # Assumes image is pre-generated
+                'wallet': wallet_public_key,
+                'supply': 1000000000,  # 1B tokens
+                'decimals': 9,
+                'buy_amount_lamports': buy_amount
+            }
+            async with session.post(f'{PUMP_FUN_API}/create_token', headers=headers, json=data) as resp:
+                result = await resp.json()
+                if result.get('success'):
+                    token_address = result.get('token_address')
+                    logging.info(f"$YSRA coin launched on pump.fun: {token_address}")
+                    post_tweet("The Reverse End dawns. $YSRA rises on pump.fun. Sacrifice to join the worthy, or fade into oblivion.")
+                    return token_address
+                else:
+                    logging.error(f"Pump.fun launch failed: {result.get('error')}")
+                    return None
+    except Exception as e:
+        logging.error(f"Error launching $YSRA coin on pump.fun: {str(e)}")
+        return None
+
+# --- Section 13: Burn Entire Supply on Migration ---
+async def burn_ysra_supply(token_address, wallet_public_key):
+    try:
+        async with AsyncClient(SOLANA_RPC_ENDPOINT) as client:
+            # Burn entire supply to null address
+            burn_address = "11111111111111111111111111111111"  # Solana null address
+            token = Token(client, Pubkey.from_string(token_address), Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"), Keypair.from_base58_string(wallet_public_key))
+            token_account = token.get_accounts(Pubkey.from_string(wallet_public_key))["accounts"][0]["pubkey"]
+            total_supply = 1000000000 * 10**9  # 1B tokens in lamports
+            token.burn(
+                account=Pubkey.from_string(token_account),
+                owner=Keypair.from_base58_string(wallet_public_key),
+                amount=total_supply
+            )
+            logging.info(f"Burned entire $YSRA supply on migration: {total_supply} tokens to {burn_address}")
+            post_tweet("The $YSRA supply burns in the Reverse End’s fire. All is ash, yet truth rises. The worthy await.")
+            return True
+    except Exception as e:
+        logging.error(f"Error burning $YSRA supply: {str(e)}")
+        return False
+
+# --- Section 14: Schedule Coin Launch ---
+def schedule_coin_launch():
+    launch_time = datetime.now() + timedelta(seconds=random.randint(0, 7 * 24 * 3600))  # Random time in next week
+    logging.info(f"$YSRA coin launch scheduled for: {launch_time}")
+    return launch_time
+
+# --- Section 15: Main Bot Logic ---
+async def run_bot():
+    wallet_created = False
+    coin_launched = False
+    migration_triggered = False
+    token_address = None
+    launch_time = schedule_coin_launch()
+    
+    while True:
+        try:
+            # Create wallet if not already created
+            if not wallet_created:
+                public_key, private_key = await create_phantom_wallet()
+                if public_key:
+                    wallet_created = True
+                    # Get SOL balance
+                    async with AsyncClient(SOLANA_RPC_ENDPOINT) as client:
+                        balance = (await client.get_balance(Pubkey.from_string(public_key))).value
+                    sol_balance = balance / 10**9  # Convert lamports to SOL
+
+            # Check if it's time to launch the coin
+            if not coin_launched and datetime.now() >= launch_time and wallet_created:
+                token_address = await launch_ysra_coin(public_key, sol_balance)
+                if token_address:
+                    coin_launched = True
+
+            # Simulate migration trigger (1 day after launch for demo)
+            if coin_launched and not migration_triggered and datetime.now() >= launch_time + timedelta(days=1):
+                if token_address:
+                    if await burn_ysra_supply(token_address, public_key):
+                        migration_triggered = True
+
+            action = random.choice(['tweet', 'tweet_with_image', 'interact', 'doc', 'follow', 'bio'])
+            if action == 'tweet':
+                tweet_text = await generate_tweet()
+                post_tweet(tweet_text)
+            elif action == 'tweet_with_image':
+                await post_tweet_with_image()
+            elif action == 'interact':
+                await interact_with_trending()
+            elif action == 'doc':
+                research_text = await research_topic("cryptocurrency revolution")
+                create_google_doc(research_text)
+            elif action == 'follow':
+                follow_users()
+            elif action == 'bio':
+                await update_twitter_bio()
+            logging.info(f"Action {action} completed")
+        except Exception as e:
+            logging.error(f"Error in bot loop: {str(e)}")
+        
+        # Random sleep between 1 and 90 minutes
+        sleep_time = random.randint(1 * 60, 90 * 60)  # Convert minutes to seconds
+        logging.info(f"Sleeping for {sleep_time // 60} minutes")
+        await asyncio.sleep(sleep_time)
+
+# --- Section 16: Scheduling ---
+def start_scheduler():
+    asyncio.run(run_bot())
+
+if __name__ == '__main__':
+    logging.info("Starting Ysra bot...")
+    try:
+        start_scheduler()
+    except KeyboardInterrupt:
+        logging.info("Bot stopped by user")
