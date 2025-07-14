@@ -42,9 +42,10 @@ GROK_API_KEY = os.getenv('GROK_API_KEY')
 # Google API credentials
 GOOGLE_CREDENTIALS_FILE = 'credentials.json'
 
-# Solana RPC endpoint and Pump.fun API (simulated)
+# Solana RPC endpoint Pump.fun and Letsbonk.fun API 
 SOLANA_RPC_ENDPOINT = os.getenv('SOLANA_RPC_ENDPOINT', 'https://api.mainnet-beta.solana.com')
 PUMP_FUN_API = 'https://api.pump.fun'  # Placeholder, replace with actual endpoint
+LETSBONK_FUN_API = 'https://api.letsbonk.fun'  # Placeholder, replace with actual endpoint
 
 # Initialize Twitter API
 auth = tweepy.OAuthHandler(TWITTER_API_KEY, TWITTER_API_SECRET)
